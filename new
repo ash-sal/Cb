@@ -1,20 +1,61 @@
 
+@IsTest
+static void successfulFraudMailboxEmail() {
+    Case fraudCase = makeCase();
+    EmailTemplate template = makeTemplate();
 
-private static EmailTemplate makeTemplate() {
-    EmailTemplate template;
+    addFile(
+        fraudCase.Id,
+        'fraud-evidence',
+        Blob.valueOf('Fraud evidence attachment')
+    );
 
-    System.runAs(new User(Id = UserInfo.getUserId())) {
-        template = new EmailTemplate(
-            Name = 'Fraud Mailbox Unit Test',
-            DeveloperName = 'Fraud_Mailbox_Unit_Test',
-            FolderId = UserInfo.getUserId(),
-            TemplateType = 'text',
-            Subject = 'Fraud case notification',
-            Body = 'Fraud case attached.'
+    List<OrgWideEmailAddress> addresses = [
+        SELECT Id
+        FROM OrgWideEmailAddress
+        WHERE IsAllowAllProfiles = true
+        LIMIT 1
+    ];
+
+    Assert.isFalse(
+        addresses.isEmpty(),
+        'A verified Org-Wide Email Address is required.'
+    );
+
+    SendFraudMailboxEmail.EmailRequest request =
+        requestFor(
+            fraudCase.Id,
+            template.Id,
+            addresses[0].Id,
+            RECIPIENT
         );
 
-        insert template;
-    }
+    Test.startTest();
 
-    return template;
+    List<SendFraudMailboxEmail.EmailResponse> results =
+        SendFraudMailboxEmail.sendFraudMailboxEmails(
+            new List<SendFraudMailboxEmail.EmailRequest>{
+                request
+            }
+        );
+
+    Test.stopTest();
+
+    Assert.areEqual(
+        1,
+        results.size(),
+        'Expected one response.'
+    );
+
+    Assert.isTrue(
+        results[0].success,
+        'Expected successful email send. Actual: ' +
+        results[0].statusMessage
+    );
+
+    Assert.areEqual(
+        'Fraud Mailbox email sent successfully.',
+        results[0].statusMessage
+    );
+}
 }
