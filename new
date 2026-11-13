@@ -1,61 +1,356 @@
+public with sharing class SendFraudMailboxEmail {
 
-@IsTest
-static void successfulFraudMailboxEmail() {
-    Case fraudCase = makeCase();
-    EmailTemplate template = makeTemplate();
+    private static final Integer MAX_TOTAL_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024;
 
-    addFile(
-        fraudCase.Id,
-        'fraud-evidence',
-        Blob.valueOf('Fraud evidence attachment')
-    );
+    public class EmailRequest {
+        @InvocableVariable(
+            required=true
+            label='Case Id'
+            description='Id of the Fraud Case.'
+        )
+        public Id caseId;
 
-    List<OrgWideEmailAddress> addresses = [
-        SELECT Id
-        FROM OrgWideEmailAddress
-        WHERE IsAllowAllProfiles = true
-        LIMIT 1
-    ];
+        @InvocableVariable(
+            required=true
+            label='Email Template Id'
+            description='Id of the Salesforce email template to render.'
+        )
+        public Id templateId;
 
-    Assert.isFalse(
-        addresses.isEmpty(),
-        'A verified Org-Wide Email Address is required.'
-    );
+        @InvocableVariable(
+            required=true
+            label='Org-Wide Email Address Id'
+            description='Id of the Org-Wide Email Address used as the sender.'
+        )
+        public Id orgWideEmailId;
 
-    SendFraudMailboxEmail.EmailRequest request =
-        requestFor(
-            fraudCase.Id,
-            template.Id,
-            addresses[0].Id,
-            RECIPIENT
-        );
+        @InvocableVariable(
+            required=true
+            label='Fraud Mailbox Email'
+            description='Email address of the Fraud Mailbox Contact.'
+        )
+        public String fraudMailboxEmail;
+    }
 
-    Test.startTest();
+    public class EmailResponse {
+        @InvocableVariable(
+            label='Success'
+            description='True when the email was sent successfully.'
+        )
+        public Boolean success;
 
-    List<SendFraudMailboxEmail.EmailResponse> results =
-        SendFraudMailboxEmail.sendFraudMailboxEmails(
-            new List<SendFraudMailboxEmail.EmailRequest>{
-                request
+        @InvocableVariable(
+            label='Status Message'
+            description='Detailed result of the email operation.'
+        )
+        public String statusMessage;
+    }
+
+    private class PreparedEmail {
+
+        public Messaging.SingleEmailMessage email;
+        public Integer responseIndex;
+
+        public PreparedEmail(
+            Messaging.SingleEmailMessage email,
+            Integer responseIndex
+        ) {
+            this.email = email;
+            this.responseIndex = responseIndex;
+        }
+    }
+
+    @InvocableMethod(
+        label='Send Fraud Mailbox Email'
+        description='Sends a Fraud Case email to the Fraud Mailbox Contact and attaches all latest Files related to the Case.'
+    )
+    public static List<EmailResponse> sendFraudMailboxEmails(List<EmailRequest> requests) {
+        List<EmailResponse> responses = new List<EmailResponse>();
+
+        if (requests == null || requests.isEmpty()) {
+            return responses;
+        }
+
+        Set<Id> caseIds = new Set<Id>();
+
+        for (EmailRequest request : requests) {
+            EmailResponse response = new EmailResponse();
+            response.success = false;
+            response.statusMessage = 'Email was not sent.';
+            responses.add(response);
+
+            if (request != null && request.caseId != null) {
+                caseIds.add(request.caseId);
             }
-        );
+        }
 
-    Test.stopTest();
+        Map<Id, Set<Id>> caseToDocumentIds = new Map<Id, Set<Id>>();
+        Set<Id> allDocumentIds = new Set<Id>();
 
-    Assert.areEqual(
-        1,
-        results.size(),
-        'Expected one response.'
-    );
+        if (!caseIds.isEmpty()) {
+            for (ContentDocumentLink link : [
+                SELECT LinkedEntityId, ContentDocumentId
+                FROM ContentDocumentLink
+                WHERE LinkedEntityId IN :caseIds
+            ]) {
+                if (!caseToDocumentIds.containsKey(link.LinkedEntityId)) {
+                    caseToDocumentIds.put(
+                        link.LinkedEntityId,
+                        new Set<Id>()
+                    );
+                }
 
-    Assert.isTrue(
-        results[0].success,
-        'Expected successful email send. Actual: ' +
-        results[0].statusMessage
-    );
+                caseToDocumentIds
+                    .get(link.LinkedEntityId)
+                    .add(link.ContentDocumentId);
 
-    Assert.areEqual(
-        'Fraud Mailbox email sent successfully.',
-        results[0].statusMessage
-    );
-}
+                allDocumentIds.add(link.ContentDocumentId);
+            }
+        }
+
+        Map<Id, ContentVersion> documentToLatestVersion =
+            new Map<Id, ContentVersion>();
+
+        if (!allDocumentIds.isEmpty()) {
+            for (ContentVersion version : [
+                SELECT
+                    Id,
+                    ContentDocumentId,
+                    Title,
+                    FileExtension,
+                    ContentSize
+                FROM ContentVersion
+                WHERE ContentDocumentId IN :allDocumentIds
+                AND IsLatest = true
+            ]) {
+                documentToLatestVersion.put(
+                    version.ContentDocumentId,
+                    version
+                );
+            }
+        }
+
+        List<PreparedEmail> preparedEmails = new List<PreparedEmail>();
+
+        for (Integer index = 0; index < requests.size(); index++) {
+            EmailRequest request = requests[index];
+            EmailResponse response = responses[index];
+
+            try {
+                String validationError = validateRequest(request);
+
+                if (validationError != null) {
+                    response.statusMessage = validationError;
+                    continue;
+                }
+
+                Set<Id> documentIds = caseToDocumentIds.get(request.caseId);
+
+                if (documentIds == null || documentIds.isEmpty()) {
+                    response.statusMessage =
+                        'No Related Files were found on Case ' +
+                        String.valueOf(request.caseId) +
+                        '. The Fraud Mailbox email was not sent.';
+
+                    continue;
+                }
+
+                List<Id> contentVersionIds = new List<Id>();
+                Integer totalAttachmentSize = 0;
+
+                for (Id documentId : documentIds) {
+                    ContentVersion version =
+                        documentToLatestVersion.get(documentId);
+
+                    if (version == null) {
+                        continue;
+                    }
+
+                    contentVersionIds.add(version.Id);
+
+                    if (version.ContentSize != null) {
+                        totalAttachmentSize += version.ContentSize;
+                    }
+                }
+
+                if (contentVersionIds.isEmpty()) {
+                    response.statusMessage =
+                        'No latest ContentVersion records were found for ' +
+                        'the Related Files on Case ' +
+                        String.valueOf(request.caseId) +
+                        '. The email was not sent.';
+
+                    continue;
+                }
+
+                if (totalAttachmentSize > MAX_TOTAL_ATTACHMENT_SIZE_BYTES) {
+                    Decimal totalSizeMb =
+                        Decimal.valueOf(totalAttachmentSize)
+                            .divide(1024 * 1024, 2);
+
+                    response.statusMessage =
+                        'The Fraud Mailbox email was not sent because the ' +
+                        'Related Files total approximately ' +
+                        String.valueOf(totalSizeMb) +
+                        ' MB, which exceeds the configured 10 MB limit.';
+
+                    continue;
+                }
+
+                Messaging.SingleEmailMessage renderedTemplate =
+                    Messaging.renderStoredEmailTemplate(
+                        request.templateId,
+                        null,
+                        request.caseId
+                    );
+
+                Messaging.SingleEmailMessage email =
+                    new Messaging.SingleEmailMessage();
+
+                email.setSubject(renderedTemplate.getSubject());
+                email.setHtmlBody(renderedTemplate.getHtmlBody());
+                email.setPlainTextBody(
+                    renderedTemplate.getPlainTextBody()
+                );
+
+                email.setToAddresses(
+                    new List<String>{
+                        request.fraudMailboxEmail.trim()
+                    }
+                );
+
+                email.setOrgWideEmailAddressId(
+                    request.orgWideEmailId
+                );
+
+                email.setWhatId(request.caseId);
+                email.setSaveAsActivity(true);
+
+                email.setEntityAttachments(contentVersionIds);
+
+                preparedEmails.add(
+                    new PreparedEmail(email, index)
+                );
+
+            } catch (Exception ex) {
+                response.success = false;
+                response.statusMessage =
+                    'Failed to prepare the Fraud Mailbox email for Case ' +
+                    getCaseIdForMessage(request) +
+                    ': ' +
+                    ex.getMessage();
+            }
+        }
+
+        if (!preparedEmails.isEmpty()) {
+            List<Messaging.SingleEmailMessage> emailsToSend =
+                new List<Messaging.SingleEmailMessage>();
+
+            for (PreparedEmail prepared : preparedEmails) {
+                emailsToSend.add(prepared.email);
+            }
+
+            try {
+                Messaging.SendEmailResult[] sendResults =
+                    Messaging.sendEmail(emailsToSend, false);
+
+                for (Integer resultIndex = 0;
+                     resultIndex < sendResults.size();
+                     resultIndex++) {
+
+                    Messaging.SendEmailResult sendResult =
+                        sendResults[resultIndex];
+
+                    PreparedEmail prepared =
+                        preparedEmails[resultIndex];
+
+                    EmailResponse response =
+                        responses[prepared.responseIndex];
+
+                    if (sendResult.isSuccess()) {
+                        response.success = true;
+                        response.statusMessage =
+                            'Fraud Mailbox email sent successfully.';
+                    } else {
+                        response.success = false;
+                        response.statusMessage =
+                            buildSendErrorMessage(
+                                sendResult.getErrors()
+                            );
+                    }
+                }
+
+            } catch (Exception ex) {
+                for (PreparedEmail prepared : preparedEmails) {
+                    EmailResponse response =
+                        responses[prepared.responseIndex];
+
+                    response.success = false;
+                    response.statusMessage =
+                        'Fraud Mailbox email sending failed: ' +
+                        ex.getMessage();
+                }
+            }
+        }
+
+        return responses;
+    }
+
+    private static String validateRequest(EmailRequest request) {
+        if (request == null) {
+            return 'The Flow supplied an empty email request.';
+        }
+
+        if (request.caseId == null) {
+            return 'Case Id is required.';
+        }
+
+        if (request.templateId == null) {
+            return 'Email Template Id is required for Case ' +
+                String.valueOf(request.caseId) +
+                '.';
+        }
+
+        if (request.orgWideEmailId == null) {
+            return 'Org-Wide Email Address Id is required for Case ' +
+                String.valueOf(request.caseId) +
+                '.';
+        }
+
+        if (String.isBlank(request.fraudMailboxEmail)) {
+            return 'Fraud Mailbox Contact email is blank for Case ' +
+                String.valueOf(request.caseId) +
+                '.';
+        }
+
+        return null;
+    }
+
+    private static String buildSendErrorMessage(Messaging.SendEmailError[] errors) {
+        if (errors == null || errors.isEmpty()) {
+            return 'Salesforce did not send the Fraud Mailbox email, ' +
+                'but no detailed error was returned.';
+        }
+
+        List<String> messages = new List<String>();
+
+        for (Messaging.SendEmailError error : errors) {
+            messages.add(
+                String.valueOf(error.getStatusCode()) +
+                ': ' +
+                error.getMessage()
+            );
+        }
+
+        return 'Fraud Mailbox email failed: ' +
+            String.join(messages, ' | ');
+    }
+
+    private static String getCaseIdForMessage(EmailRequest request) {
+        if (request == null || request.caseId == null) {
+            return 'unknown';
+        }
+
+        return String.valueOf(request.caseId);
+    }
 }
