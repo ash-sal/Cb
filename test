@@ -4,333 +4,190 @@ private class SendFraudMailboxEmailTest {
     private static final String RECIPIENT = 'fraudmailbox@example.com';
 
     private static Case makeCase() {
-        Case c = new Case(
-            Subject = 'Fraud mailbox test',
-            Status = 'New',
-            Origin = 'Phone'
-        );
-        insert c;
-        return c;
+        Case record = new Case(Subject='Fraud mailbox test', Status='New', Origin='Phone');
+        insert record;
+        return record;
     }
 
     private static EmailTemplate makeTemplate() {
         EmailTemplate template;
-
-        System.runAs(new User(Id = UserInfo.getUserId())) {
+        System.runAs(new User(Id=UserInfo.getUserId())) {
             template = new EmailTemplate(
-                Name = 'Fraud Mailbox Unit Test',
-                DeveloperName = 'Fraud_Mailbox_Unit_Test',
-                FolderId = UserInfo.getUserId(),
-                TemplateType = 'text',
-                Subject = 'Fraud case notification',
-                Body = 'Fraud case attached.'
+                Name='Fraud Mailbox Unit Test',
+                DeveloperName='Fraud_Mailbox_Unit_Test',
+                FolderId=UserInfo.getUserId(),
+                TemplateType='text',
+                Subject='Fraud case notification',
+                Body='Fraud case attached.'
             );
-
             insert template;
         }
-
         return template;
     }
-    
-    private static Id addFile(
-        Id caseId,
-        String name,
-        Blob body
-    ) {
-        ContentVersion cv = new ContentVersion(
-            Title = name,
-            PathOnClient = name + '.txt',
-            VersionData = body,
-            FirstPublishLocationId = caseId
-        );
-        insert cv;
 
-        return [
-            SELECT ContentDocumentId
-            FROM ContentVersion
-            WHERE Id = :cv.Id
-        ].ContentDocumentId;
+    private static Id addFile(Id caseId, String name, Blob body) {
+        ContentVersion version = new ContentVersion(
+            Title=name,
+            PathOnClient=name + '.txt',
+            VersionData=body,
+            FirstPublishLocationId=caseId
+        );
+        insert version;
+        return [SELECT ContentDocumentId FROM ContentVersion WHERE Id=:version.Id].ContentDocumentId;
     }
 
     private static SendFraudMailboxEmail.EmailRequest requestFor(
-        Id caseId,
-        Id templateId,
-        Id orgWideId,
-        String recipient
+        Id caseId, Id templateId, Id orgWideId, String recipient
     ) {
-        SendFraudMailboxEmail.EmailRequest r =
-            new SendFraudMailboxEmail.EmailRequest();
-
-        r.caseId = caseId;
-        r.templateId = templateId;
-        r.orgWideEmailId = orgWideId;
-        r.fraudMailboxEmail = recipient;
-
-        return r;
+        SendFraudMailboxEmail.EmailRequest request = new SendFraudMailboxEmail.EmailRequest();
+        request.caseId = caseId;
+        request.templateId = templateId;
+        request.orgWideEmailId = orgWideId;
+        request.fraudMailboxEmail = recipient;
+        return request;
     }
-    
+
     @IsTest
     static void successfulFraudMailboxEmail() {
         Case fraudCase = makeCase();
         EmailTemplate template = makeTemplate();
-    
-        addFile(fraudCase.Id,'fraud-evidence', Blob.valueOf('Fraud evidence attachment'));
-    
+        addFile(fraudCase.Id, 'fraud-evidence', Blob.valueOf('Fraud evidence attachment'));
+        // Same org-dependent prerequisite as the original working test.
         List<OrgWideEmailAddress> addresses = [
-            SELECT Id
-            FROM OrgWideEmailAddress
-            WHERE IsAllowAllProfiles = true
-            LIMIT 1
+            SELECT Id FROM OrgWideEmailAddress WHERE IsAllowAllProfiles = true LIMIT 1
         ];
-    
-        SendFraudMailboxEmail.EmailRequest request =
-            requestFor(
-                fraudCase.Id,
-                template.Id,
-                addresses[0].Id,
-                RECIPIENT
-            );
-    
+        Assert.isFalse(addresses.isEmpty(), 'A permitted Org-Wide Email Address is required.');
+        SendFraudMailboxEmail.EmailRequest request = requestFor(
+            fraudCase.Id, template.Id, addresses[0].Id, RECIPIENT
+        );
         Test.startTest();
-    
         List<SendFraudMailboxEmail.EmailResponse> results =
             SendFraudMailboxEmail.sendFraudMailboxEmails(
-                new List<SendFraudMailboxEmail.EmailRequest>{
-                    request
-                }
+                new List<SendFraudMailboxEmail.EmailRequest>{request}
             );
-    
         Test.stopTest();
-    
         Assert.areEqual(1, results.size(), 'Expected one response.');
-        Assert.isTrue(results[0].success, 'Expected successful email send. Actual: ' + results[0].statusMessage);
+        Assert.isTrue(results[0].success,
+            'Expected successful email send. Actual: ' + results[0].statusMessage);
     }
 
     @IsTest
     static void nullAndEmptyRequestLists() {
         Test.startTest();
-
         List<SendFraudMailboxEmail.EmailResponse> nullResults =
             SendFraudMailboxEmail.sendFraudMailboxEmails(null);
-
         List<SendFraudMailboxEmail.EmailResponse> emptyResults =
             SendFraudMailboxEmail.sendFraudMailboxEmails(
                 new List<SendFraudMailboxEmail.EmailRequest>()
             );
-
         Test.stopTest();
-
         Assert.areEqual(0, nullResults.size());
         Assert.areEqual(0, emptyResults.size());
     }
 
     @IsTest
     static void missingRequiredFields() {
-        Case c = makeCase();
-        EmailTemplate t = makeTemplate();
-
-        Id dummyOrgWideId = (Id) '0D2000000000001';
-
+        Case record = makeCase();
+        EmailTemplate template = makeTemplate();
+        // A non-null test-generated Id is sufficient for paths that fail validation first.
+        Id placeholderId = record.Id;
         List<SendFraudMailboxEmail.EmailRequest> requests =
             new List<SendFraudMailboxEmail.EmailRequest>{
                 null,
-                requestFor(null, t.Id, dummyOrgWideId, RECIPIENT),
-                requestFor(c.Id, null, dummyOrgWideId, RECIPIENT),
-                requestFor(c.Id, t.Id, null, RECIPIENT),
-                requestFor(c.Id, t.Id, dummyOrgWideId, ' ')
+                requestFor(null, template.Id, placeholderId, RECIPIENT),
+                requestFor(record.Id, null, placeholderId, RECIPIENT),
+                requestFor(record.Id, template.Id, null, RECIPIENT),
+                requestFor(record.Id, template.Id, placeholderId, ' ')
             };
-
         Test.startTest();
-
         List<SendFraudMailboxEmail.EmailResponse> results =
-            SendFraudMailboxEmail.sendFraudMailboxEmails(
-                requests
-            );
-
+            SendFraudMailboxEmail.sendFraudMailboxEmails(requests);
         Test.stopTest();
-
         Assert.areEqual(5, results.size());
-
-        Assert.areEqual(false,results[0].success,'Expected a failure response');
-        Assert.isNotNull(results[0].statusMessage);
-        Assert.isTrue(
-            results[0].statusMessage.contains(
-                'empty email request'
-            ),
-            'Unexpected status: ' + results[0].statusMessage
-        );
-
-        Assert.areEqual(
-            false,
-            results[1].success
-        );
-        Assert.isNotNull(results[1].statusMessage);
-        Assert.isTrue(results[1].statusMessage.contains('Case Id is required'),
-            'Unexpected status: ' + results[1].statusMessage
-        );
-
-        Assert.areEqual(false,results[2].success);
-        Assert.isNotNull(results[2].statusMessage);
-        Assert.isTrue(results[2].statusMessage.contains('Email Template Id is required'),
-            'Unexpected status: ' + results[2].statusMessage
-        );
-
-        Assert.areEqual(false,results[3].success);
-        Assert.isNotNull(results[3].statusMessage);
-        Assert.isTrue(results[3].statusMessage.contains('Org-Wide Email Address Id is required'),
-            'Unexpected status: ' + results[3].statusMessage
-        );
-
-        Assert.areEqual(false,results[4].success);
-        Assert.isNotNull(results[4].statusMessage);
-        Assert.isTrue(results[4].statusMessage.contains('email is blank'),
-            'Unexpected status: ' + results[4].statusMessage
-        );
+        List<String> expected = new List<String>{
+            'empty email request', 'Case Id is required',
+            'Email Template Id is required', 'Org-Wide Email Address Id is required',
+            'email is blank'
+        };
+        for (Integer i = 0; i < results.size(); i++) {
+            Assert.areEqual(false, results[i].success, 'Request ' + i + ' should fail.');
+            Assert.isNotNull(results[i].statusMessage);
+            Assert.isTrue(results[i].statusMessage.contains(expected[i]),
+                'Unexpected status for request ' + i + ': ' + results[i].statusMessage);
+        }
     }
 
     @IsTest
     static void caseWithoutFiles() {
-        Case c = makeCase();
-        EmailTemplate t = makeTemplate();
-
-        Id dummyOrgWideId = (Id) '0D2000000000001';
-
+        Case record = makeCase();
+        EmailTemplate template = makeTemplate();
         Test.startTest();
-
         List<SendFraudMailboxEmail.EmailResponse> results =
             SendFraudMailboxEmail.sendFraudMailboxEmails(
                 new List<SendFraudMailboxEmail.EmailRequest>{
-                    requestFor(
-                        c.Id,
-                        t.Id,
-                        dummyOrgWideId,
-                        RECIPIENT
-                    )
+                    requestFor(record.Id, template.Id, record.Id, RECIPIENT)
                 }
             );
-
         Test.stopTest();
-
         Assert.areEqual(1, results.size());
         Assert.areEqual(false, results[0].success);
-        Assert.isNotNull(results[0].statusMessage);
-
         Assert.isTrue(results[0].statusMessage.contains('No Related Files were found'),
-            'Unexpected status: ' + results[0].statusMessage
-        );
+            'Unexpected status: ' + results[0].statusMessage);
     }
 
     @IsTest
     static void relatedFilesAndLatestVersionAreProcessed() {
-        Case c = makeCase();
-        EmailTemplate t = makeTemplate();
-
-        Id firstDoc = addFile(
-            c.Id,
-            'evidence-one',
-            Blob.valueOf('First version')
+        Case record = makeCase();
+        EmailTemplate template = makeTemplate();
+        Id firstDocument = addFile(record.Id, 'evidence-one', Blob.valueOf('First version'));
+        addFile(record.Id, 'evidence-two', Blob.valueOf('Second document'));
+        insert new ContentVersion(
+            ContentDocumentId=firstDocument,
+            Title='evidence-one-updated',
+            PathOnClient='evidence-one-updated.txt',
+            VersionData=Blob.valueOf('Updated version')
         );
-
-        addFile(
-            c.Id,
-            'evidence-two',
-            Blob.valueOf('Second document')
-        );
-
-        ContentVersion updated = new ContentVersion(
-            ContentDocumentId = firstDoc,
-            Title = 'evidence-one-updated',
-            PathOnClient = 'evidence-one-updated.txt',
-            VersionData = Blob.valueOf('Updated version')
-        );
-        insert updated;
-
+        Assert.areEqual(1, [
+            SELECT COUNT() FROM ContentVersion
+            WHERE ContentDocumentId=:firstDocument AND IsLatest=true
+        ]);
         Test.startTest();
-
         List<SendFraudMailboxEmail.EmailResponse> results =
             SendFraudMailboxEmail.sendFraudMailboxEmails(
                 new List<SendFraudMailboxEmail.EmailRequest>{
-                    requestFor(
-                        c.Id,
-                        t.Id,
-                        (Id) '0D2000000000001',
-                        RECIPIENT
-                    )
+                    requestFor(record.Id, template.Id, record.Id, RECIPIENT)
                 }
             );
-
         Test.stopTest();
-
         Assert.areEqual(1, results.size());
         Assert.isNotNull(results[0].statusMessage);
-
-        Assert.isTrue(!results[0].statusMessage.contains(
-                'No Related Files were found'
-            ) &&
-            !results[0].statusMessage.contains(
-                'No latest ContentVersion records were found'
-            ),
-            'Expected to process attached ContentVersions: ' +
-            results[0].statusMessage
-        );
+        Assert.isFalse(results[0].statusMessage.contains('No Related Files were found'),
+            'Files should have been located: ' + results[0].statusMessage);
+        Assert.isFalse(results[0].statusMessage.contains('No latest ContentVersion records were found'),
+            'Latest versions should have been located: ' + results[0].statusMessage);
     }
 
     @IsTest
     static void multipleRequestsKeepTheirResponseOrder() {
         Case withFile = makeCase();
         Case withoutFile = makeCase();
-
-        addFile(
-            withFile.Id,
-            'fraud-evidence',
-            Blob.valueOf('Evidence')
-        );
-
-        EmailTemplate t = makeTemplate();
-        Id dummyOrgWideId = (Id) '0D2000000000001';
-
+        addFile(withFile.Id, 'fraud-evidence', Blob.valueOf('Evidence'));
+        EmailTemplate template = makeTemplate();
         Test.startTest();
-
         List<SendFraudMailboxEmail.EmailResponse> results =
             SendFraudMailboxEmail.sendFraudMailboxEmails(
                 new List<SendFraudMailboxEmail.EmailRequest>{
-                    requestFor(
-                        withoutFile.Id,
-                        t.Id,
-                        dummyOrgWideId,
-                        RECIPIENT
-                    ),
-                    requestFor(
-                        withFile.Id,
-                        null,
-                        dummyOrgWideId,
-                        RECIPIENT
-                    ),
-                    requestFor(
-                        withFile.Id,
-                        t.Id,
-                        dummyOrgWideId,
-                        RECIPIENT
-                    )
+                    requestFor(withoutFile.Id, template.Id, withFile.Id, RECIPIENT),
+                    requestFor(withFile.Id, null, withFile.Id, RECIPIENT),
+                    requestFor(withFile.Id, template.Id, withFile.Id, RECIPIENT)
                 }
             );
-
         Test.stopTest();
-
         Assert.areEqual(3, results.size());
-
         Assert.areEqual(false, results[0].success);
-        Assert.isNotNull(results[0].statusMessage);
-        Assert.isTrue(results[0].statusMessage.contains('No Related Files were found'),
-            'Unexpected status: ' + results[0].statusMessage
-        );
-
+        Assert.isTrue(results[0].statusMessage.contains('No Related Files were found'));
         Assert.areEqual(false, results[1].success);
-        Assert.isNotNull(results[1].statusMessage);
-        Assert.isTrue(results[1].statusMessage.contains('Email Template Id is required'),
-            'Unexpected status: ' + results[1].statusMessage
-        );
-
+        Assert.isTrue(results[1].statusMessage.contains('Email Template Id is required'));
         Assert.isNotNull(results[2].statusMessage);
     }
 }
