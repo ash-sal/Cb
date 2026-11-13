@@ -1,1 +1,20 @@
 
+
+private static EmailTemplate makeTemplate() {
+    EmailTemplate template;
+
+    System.runAs(new User(Id = UserInfo.getUserId())) {
+        template = new EmailTemplate(
+            Name = 'Fraud Mailbox Unit Test',
+            DeveloperName = 'Fraud_Mailbox_Unit_Test',
+            FolderId = UserInfo.getUserId(),
+            TemplateType = 'text',
+            Subject = 'Fraud case notification',
+            Body = 'Fraud case attached.'
+        );
+
+        insert template;
+    }
+
+    return template;
+}
