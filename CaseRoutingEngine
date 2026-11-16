@@ -1,0 +1,586 @@
+public with sharing class CaseRoutingEngine {
+
+    private static final String SUPPORT_TYPE_LIVE_SUPPORT = 'Live Support';
+
+    private static final String RT_DUE_DILIGENCE = 'Due_Diligence';
+    private static final String RT_COMPLAINTS = 'Complaints';
+    private static final String RT_QUERY_MANAGEMENT = 'Query_Management';
+
+    private static final String ROUTE_CLIENT_SUPPORT = 'CLIENT_SUPPORT';
+    private static final String ROUTE_COMPLAINTS = 'COMPLAINTS';
+    private static final String ROUTE_KEY_CLIENT = 'KEY_CLIENT';
+    private static final String ROUTE_MCCY = 'MCCY';
+    private static final String ROUTE_EXCEPTIONS = 'EXCEPTIONS';
+    private static final String ROUTE_UK_EXCEPTIONS = 'UK_EXCEPTIONS';
+    private static final String ROUTE_ONBOARDING = 'ONBOARDING';
+    private static final String ROUTE_REVIEW = 'REVIEW';
+    private static final String ROUTE_EU_CLIENT_SUPPORT = 'EU_CLIENT_SUPPORT';
+
+    private static final String PAYMENT_QUERY_BENEFICIARY_NON_RECEIPT =
+        'Beneficiary claiming non-receipt of funds';
+
+    private static Map<String, Id> queueIdByRouteKey;
+    private static Map<Id, Schema.RecordTypeInfo> caseRecordTypeInfoById;
+
+    public static void beforeInsert(List<Case> newCases) {
+        Map<String, List<Case>> casesByRecordType = groupCasesByRecordType(newCases);
+
+        new DueDiligenceRouter().route(
+            casesByRecordType.get(RT_DUE_DILIGENCE)
+        );
+        new ComplaintsRouter().route(
+            casesByRecordType.get(RT_COMPLAINTS)
+        );
+        new QueryManagementRouter().route(
+            casesByRecordType.get(RT_QUERY_MANAGEMENT)
+        );
+    }
+
+    public static void beforeUpdate(List<Case> newCases, Map<Id, Case> oldMap) {
+        new UpdateRouter().route(newCases, oldMap);
+    }
+
+    private static Map<String, List<Case>> groupCasesByRecordType(
+        List<Case> casesToGroup
+    ) {
+        Map<String, List<Case>> result = new Map<String, List<Case>>();
+
+        for (Case caseRecord : casesToGroup) {
+            String developerName = getRecordTypeDeveloperName(
+                caseRecord.RecordTypeId
+            );
+            addCase(result, developerName, caseRecord);
+        }
+
+        return result;
+    }
+
+    private static void addCase(
+        Map<String, List<Case>> casesByRecordType,
+        String developerName,
+        Case caseRecord
+    ) {
+        if (String.isBlank(developerName)) {
+            return;
+        }
+
+        if (!casesByRecordType.containsKey(developerName)) {
+            casesByRecordType.put(developerName, new List<Case>());
+        }
+
+        casesByRecordType.get(developerName).add(caseRecord);
+    }
+
+    private static String getRecordTypeDeveloperName(Id recordTypeId) {
+        if (recordTypeId == null) {
+            return null;
+        }
+
+        if (caseRecordTypeInfoById == null) {
+            caseRecordTypeInfoById =
+                Case.SObjectType.getDescribe().getRecordTypeInfosById();
+        }
+
+        Schema.RecordTypeInfo info = caseRecordTypeInfoById.get(recordTypeId);
+        return info == null ? null : info.getDeveloperName();
+    }
+
+    private static Id getRecordTypeIdByDeveloperName(String developerName) {
+        if (String.isBlank(developerName)) {
+            return null;
+        }
+
+        Schema.RecordTypeInfo info = Case.SObjectType
+            .getDescribe()
+            .getRecordTypeInfosByDeveloperName()
+            .get(developerName);
+
+        return info == null ? null : info.getRecordTypeId();
+    }
+
+    private static Id getQueueId(String routeKey) {
+        return getQueueIdsByRouteKey().get(routeKey);
+    }
+
+    private static void assignOwnerIfRouteExists(
+        Case caseRecord,
+        String routeKey
+    ) {
+        Id queueId = getQueueId(routeKey);
+
+        if (queueId != null) {
+            caseRecord.OwnerId = queueId;
+        }
+    }
+
+    private static void assignOwnerAndLiveSupport(
+        Case caseRecord,
+        String routeKey
+    ) {
+        assignOwnerIfRouteExists(caseRecord, routeKey);
+        caseRecord.Support_Type__c = SUPPORT_TYPE_LIVE_SUPPORT;
+    }
+
+    private static Map<String, Id> getQueueIdsByRouteKey() {
+        if (queueIdByRouteKey == null) {
+            queueIdByRouteKey = buildQueueIdsByRouteKey();
+        }
+
+        return queueIdByRouteKey;
+    }
+
+    private static Map<String, Id> buildQueueIdsByRouteKey() {
+        Map<String, Case_Routing_Config__mdt> configs =
+            Case_Routing_Config__mdt.getAll();
+        Set<String> developerNames = getQueueDeveloperNames(configs);
+        Map<String, Id> queueIdsByDeveloperName =
+            queryQueueIdsByDeveloperName(developerNames);
+
+        return mapRouteKeysToQueueIds(configs, queueIdsByDeveloperName);
+    }
+
+    private static Set<String> getQueueDeveloperNames(
+        Map<String, Case_Routing_Config__mdt> configs
+    ) {
+        Set<String> result = new Set<String>();
+
+        for (Case_Routing_Config__mdt config : configs.values()) {
+            String developerName = config.Queue_Developer_Name__c;
+
+            if (!String.isBlank(developerName)) {
+                result.add(developerName);
+            }
+        }
+
+        return result;
+    }
+
+    private static Map<String, Id> queryQueueIdsByDeveloperName(
+        Set<String> developerNames
+    ) {
+        Map<String, Id> result = new Map<String, Id>();
+
+        if (developerNames.isEmpty()) {
+            return result;
+        }
+
+        for (Group queueRecord : [
+            SELECT Id, DeveloperName
+            FROM Group
+            WHERE Type = 'Queue'
+            AND DeveloperName IN :developerNames
+        ]) {
+            result.put(queueRecord.DeveloperName, queueRecord.Id);
+        }
+
+        return result;
+    }
+
+    private static Map<String, Id> mapRouteKeysToQueueIds(
+        Map<String, Case_Routing_Config__mdt> configs,
+        Map<String, Id> queueIdsByDeveloperName
+    ) {
+        Map<String, Id> result = new Map<String, Id>();
+
+        for (String routeKey : configs.keySet()) {
+            Case_Routing_Config__mdt config = configs.get(routeKey);
+            Id queueId = queueIdsByDeveloperName.get(
+                config.Queue_Developer_Name__c
+            );
+
+            if (queueId != null) {
+                result.put(routeKey, queueId);
+            }
+        }
+
+        return result;
+    }
+
+    private interface Router {
+        void route(List<Case> casesToRoute);
+    }
+
+    private with sharing class ComplaintsRouter implements Router {
+
+        public void route(List<Case> casesToRoute) {
+            if (casesToRoute == null || casesToRoute.isEmpty()) {
+                return;
+            }
+
+            DateTime currentDateTime = System.now();
+
+            for (Case caseRecord : casesToRoute) {
+                routeCase(caseRecord, currentDateTime);
+            }
+        }
+
+        private void routeCase(Case caseRecord, DateTime currentDateTime) {
+            if (caseRecord.Origin == 'Portal') {
+                assignOwnerIfRouteExists(caseRecord, ROUTE_COMPLAINTS);
+            }
+
+            caseRecord.X3_Days_Start_Date_Complaints__c = currentDateTime;
+            caseRecord.X15_Days_Start_Date_Complaints__c = currentDateTime;
+        }
+    }
+
+    private with sharing class DueDiligenceRouter implements Router {
+
+        public void route(List<Case> casesToRoute) {
+            if (casesToRoute == null || casesToRoute.isEmpty()) {
+                return;
+            }
+
+            Map<Id, Id> recentCaseIdByAccountId =
+                getMostRecentCaseIdByAccountId(casesToRoute);
+
+            for (Case caseRecord : casesToRoute) {
+                routeCase(caseRecord, recentCaseIdByAccountId);
+            }
+        }
+
+        private void routeCase(
+            Case caseRecord,
+            Map<Id, Id> recentCaseIdByAccountId
+        ) {
+            setRecentDueDiligenceCase(caseRecord, recentCaseIdByAccountId);
+            routeReviewType(caseRecord);
+        }
+
+        private void setRecentDueDiligenceCase(
+            Case caseRecord,
+            Map<Id, Id> recentCaseIdByAccountId
+        ) {
+            if (caseRecord.AccountId == null) {
+                return;
+            }
+
+            caseRecord.Recent_Due_Diligence_Case__c =
+                recentCaseIdByAccountId.get(caseRecord.AccountId);
+        }
+
+        private void routeReviewType(Case caseRecord) {
+            if (caseRecord.Review_Type__c == 'Onboarding') {
+                assignOwnerIfRouteExists(caseRecord, ROUTE_ONBOARDING);
+                return;
+            }
+
+            if (caseRecord.Review_Type__c == 'Periodic Review') {
+                assignOwnerIfRouteExists(caseRecord, ROUTE_REVIEW);
+            }
+        }
+
+        private Map<Id, Id> getMostRecentCaseIdByAccountId(
+            List<Case> casesToRoute
+        ) {
+            Set<Id> accountIds = getAccountIds(casesToRoute);
+            Id recordTypeId = getRecordTypeIdByDeveloperName(RT_DUE_DILIGENCE);
+
+            if (accountIds.isEmpty() || recordTypeId == null) {
+                return new Map<Id, Id>();
+            }
+
+            return queryMostRecentCaseIds(accountIds, recordTypeId);
+        }
+
+        private Set<Id> getAccountIds(List<Case> casesToRoute) {
+            Set<Id> accountIds = new Set<Id>();
+
+            for (Case caseRecord : casesToRoute) {
+                if (caseRecord.AccountId != null) {
+                    accountIds.add(caseRecord.AccountId);
+                }
+            }
+
+            return accountIds;
+        }
+
+        private Map<Id, Id> queryMostRecentCaseIds(
+            Set<Id> accountIds,
+            Id recordTypeId
+        ) {
+            Map<Id, Id> result = new Map<Id, Id>();
+
+            for (Case dueDiligenceCase : [
+                SELECT Id, AccountId, CreatedDate
+                FROM Case
+                WHERE AccountId IN :accountIds
+                AND RecordTypeId = :recordTypeId
+                ORDER BY CreatedDate DESC
+            ]) {
+                addFirstCaseForAccount(result, dueDiligenceCase);
+            }
+
+            return result;
+        }
+
+        private void addFirstCaseForAccount(
+            Map<Id, Id> caseIdByAccountId,
+            Case dueDiligenceCase
+        ) {
+            if (!caseIdByAccountId.containsKey(dueDiligenceCase.AccountId)) {
+                caseIdByAccountId.put(
+                    dueDiligenceCase.AccountId,
+                    dueDiligenceCase.Id
+                );
+            }
+        }
+    }
+
+    private with sharing class QueryManagementRouter implements Router {
+
+        private final Set<String> queryReasons = new Set<String>{
+            'Servicing Request',
+            'System Query',
+            'Payment Query',
+            'Account Query'
+        };
+
+        private final Set<String> recallTypes = new Set<String>{
+            'DDIC (Direct Debit Indemnity Claim)',
+            'CHAPS recall',
+            'Other recall',
+            'Multi-currency recall'
+        };
+
+        private final Set<String> mccyAccountQueryTypes = new Set<String>{
+            'Current Account Switch Service',
+            'Cash ISA',
+            'MulticurrencyAccount'
+        };
+
+        public void route(List<Case> casesToRoute) {
+            if (casesToRoute == null || casesToRoute.isEmpty()) {
+                return;
+            }
+
+            for (Case caseRecord : casesToRoute) {
+                routeCase(caseRecord);
+            }
+        }
+
+        private void routeCase(Case caseRecord) {
+            if (caseRecord.Origin != 'Portal') {
+                return;
+            }
+
+            if (caseRecord.Region__c == 'NL') {
+                assignOwnerAndLiveSupport(
+                    caseRecord,
+                    ROUTE_EU_CLIENT_SUPPORT
+                );
+                return;
+            }
+
+            if (shouldRouteToMccy(caseRecord)) {
+                assignOwnerAndLiveSupport(caseRecord, ROUTE_MCCY);
+                return;
+            }
+
+            if (queryReasons.contains(caseRecord.Reason)) {
+                routeQueryCase(caseRecord);
+                return;
+            }
+
+            if (isRecall(caseRecord)) {
+                routeRecallCase(caseRecord);
+            }
+        }
+
+        private Boolean shouldRouteToMccy(Case caseRecord) {
+            if (caseRecord.Reason != 'Payment Query') {
+                return false;
+            }
+
+            if (caseRecord.Payment_Queries__c == 'FX') {
+                return true;
+            }
+
+            if (isUkSepaPayment(caseRecord)) {
+                return true;
+            }
+
+            return isKeyEnterpriseMultiCurrency(caseRecord);
+        }
+
+        private Boolean isUkSepaPayment(Case caseRecord) {
+            if (caseRecord.Region__c != 'UK') {
+                return false;
+            }
+
+            return caseRecord.Payment_Queries__c == 'SEPA CT' ||
+                caseRecord.Payment_Queries__c == 'SEPA Instant';
+        }
+
+        private Boolean isKeyEnterpriseMultiCurrency(Case caseRecord) {
+            return caseRecord.Payment_Queries__c == 'Multi-Currency' &&
+                caseRecord.Client_Tier__c == 'Key Enterprise';
+        }
+
+        private Boolean isRecall(Case caseRecord) {
+            return caseRecord.Reason == 'Recalls' ||
+                recallTypes.contains(caseRecord.Recall_Type__c);
+        }
+
+        private void routeQueryCase(Case caseRecord) {
+            if (shouldRouteToKeyClient(caseRecord)) {
+                assignOwnerAndLiveSupport(caseRecord, ROUTE_KEY_CLIENT);
+                return;
+            }
+
+            routeQueryType(caseRecord);
+        }
+
+        private Boolean shouldRouteToKeyClient(Case caseRecord) {
+            return caseRecord.Client_Tier__c == 'Key Enterprise' &&
+                caseRecord.Payment_Query_Type__c !=
+                    PAYMENT_QUERY_BENEFICIARY_NON_RECEIPT;
+        }
+
+        private void routeQueryType(Case caseRecord) {
+            if (caseRecord.Reason == 'Account Query') {
+                routeAccountQueryType(caseRecord);
+                return;
+            }
+
+            if (caseRecord.Reason == 'Payment Query') {
+                routePaymentQueries(caseRecord);
+                return;
+            }
+
+            assignOwnerAndLiveSupport(caseRecord, ROUTE_CLIENT_SUPPORT);
+        }
+
+        private void routeAccountQueryType(Case caseRecord) {
+            String routeKey = mccyAccountQueryTypes.contains(
+                caseRecord.Account_Query_Type__c
+            )
+                ? ROUTE_MCCY
+                : ROUTE_CLIENT_SUPPORT;
+
+            assignOwnerAndLiveSupport(caseRecord, routeKey);
+        }
+
+        private void routePaymentQueries(Case caseRecord) {
+            if (caseRecord.Payment_Queries__c == 'Multi-Currency') {
+                assignOwnerAndLiveSupport(caseRecord, ROUTE_MCCY);
+                return;
+            }
+
+            routePaymentQueryType(caseRecord);
+        }
+
+        private void routePaymentQueryType(Case caseRecord) {
+            String routeKey = isBeneficiaryNonReceipt(caseRecord)
+                ? ROUTE_EXCEPTIONS
+                : ROUTE_CLIENT_SUPPORT;
+
+            assignOwnerAndLiveSupport(caseRecord, routeKey);
+        }
+
+        private Boolean isBeneficiaryNonReceipt(Case caseRecord) {
+            return caseRecord.Payment_Query_Type__c ==
+                PAYMENT_QUERY_BENEFICIARY_NON_RECEIPT;
+        }
+
+        private void routeRecallCase(Case caseRecord) {
+            String routeKey =
+                caseRecord.Recall_Type__c == 'Multi-currency recall'
+                    ? ROUTE_MCCY
+                    : ROUTE_UK_EXCEPTIONS;
+
+            assignOwnerAndLiveSupport(caseRecord, routeKey);
+        }
+    }
+
+    private with sharing class UpdateRouter {
+
+        public void route(List<Case> newCases, Map<Id, Case> oldMap) {
+            UpdateContext context = new UpdateContext();
+
+            if (!context.isUsable()) {
+                return;
+            }
+
+            for (Case newCase : newCases) {
+                routeCaseIfRequired(newCase, oldMap.get(newCase.Id), context);
+            }
+        }
+
+        private void routeCaseIfRequired(
+            Case newCase,
+            Case oldCase,
+            UpdateContext context
+        ) {
+            if (!isEligibleCase(newCase, oldCase, context)) {
+                return;
+            }
+
+            newCase.OwnerId = context.exceptionsQueueId;
+        }
+
+        private Boolean isEligibleCase(
+            Case newCase,
+            Case oldCase,
+            UpdateContext context
+        ) {
+            if (oldCase == null) {
+                return false;
+            }
+
+            if (!isQueryManagementCase(newCase)) {
+                return false;
+            }
+
+            if (!context.eligibleOwnerIds.contains(oldCase.OwnerId)) {
+                return false;
+            }
+
+            return hasChangedToBeneficiaryNonReceipt(newCase, oldCase);
+        }
+
+        private Boolean isQueryManagementCase(Case caseRecord) {
+            return getRecordTypeDeveloperName(caseRecord.RecordTypeId) ==
+                RT_QUERY_MANAGEMENT;
+        }
+
+        private Boolean hasChangedToBeneficiaryNonReceipt(
+            Case newCase,
+            Case oldCase
+        ) {
+            if (
+                oldCase.Payment_Query_Type__c ==
+                newCase.Payment_Query_Type__c
+            ) {
+                return false;
+            }
+
+            return newCase.Payment_Query_Type__c ==
+                PAYMENT_QUERY_BENEFICIARY_NON_RECEIPT;
+        }
+    }
+
+    private class UpdateContext {
+        private Set<Id> eligibleOwnerIds;
+        private Id exceptionsQueueId;
+
+        UpdateContext() {
+            eligibleOwnerIds = new Set<Id>();
+            addEligibleOwner(ROUTE_CLIENT_SUPPORT);
+            addEligibleOwner(ROUTE_EU_CLIENT_SUPPORT);
+            exceptionsQueueId = getQueueId(ROUTE_EXCEPTIONS);
+        }
+
+        private void addEligibleOwner(String routeKey) {
+            Id queueId = getQueueId(routeKey);
+
+            if (queueId != null) {
+                eligibleOwnerIds.add(queueId);
+            }
+        }
+
+        private Boolean isUsable() {
+            return !eligibleOwnerIds.isEmpty() && exceptionsQueueId != null;
+        }
+    }
+}
